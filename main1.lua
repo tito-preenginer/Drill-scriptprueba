@@ -117,12 +117,6 @@ local State = {
 
 local Config = {
     folder = "klze_hub_configs",
-    indexFile = "klze_hub_configs/_index.json",
-    autoloadFile = "klze_hub_configs/autoload.json",
-    selectedName = "default",
-    newName = "default",
-    autoloadEnabled = false,
-    autoloadName = "default",
 }
 
 local Loot = {
@@ -1058,13 +1052,6 @@ function S.buildKlzeHub()
         options = options or {}
         local uiTab = Window:AddTab("UI Settings", "settings")
         local menuBox = uiTab:AddLeftGroupbox("Menu", "wrench")
-        menuBox:AddToggle("KlzeAntiAfk", {
-            Text = "Anti-AFK",
-            Default = true,
-            Callback = function(v)
-                Hub.setAntiAfk(v)
-            end,
-        })
         menuBox:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
             Default = options.ToggleKeybind or "RightControl",
             NoUI = true,
@@ -1090,13 +1077,11 @@ function S.buildKlzeHub()
                 end
             end
         end)
-        SaveManager:BuildConfigSection(uiTab)
-        local shareBox = uiTab:AddRightGroupbox("Share", "folder")
-        shareBox:AddLabel("One config for the whole game, saved under the universe id: klze_hub/universe_" .. tostring(game.GameId) .. "/settings. Set one autoload. Lobby actions run in the lobby, and the farm runs in the match.")
-        SaveManager:LoadAutoloadConfig()
         Library.ToggleKeybind = Library.Options.MenuKeybind or Enum.KeyCode.RightControl
         task.defer(function()
-            Hub.setAntiAfk(true)
+            if not Hub._afkConn and not S._miscBuilt then
+                Hub.setAntiAfk(true)
+            end
             Hub.startPresence({ gameTitle = options.Game, version = options.Version })
         end)
         return uiTab
@@ -1146,9 +1131,10 @@ function S.attachKlzeUiAdapter(Window, Library)
         Upgrades = "sparkles",
         Drill = "arrow-down",
         Keybinds = "keyboard",
-        Config = "settings",
         ["Auto Buy"] = "store",
         Depth = "layers",
+        Misc = "wrench",
+        ["Auto Bounty Hunter"] = "crosshair",
     }
     local flags = {}
     S._klzeFlags = flags
@@ -22369,39 +22355,6 @@ function S.registerRayfieldFlag(element)
     return element
 end
 
-function S.configGetInputName()
-    local flag = Rayfield and Rayfield.Flags and Rayfield.Flags["klze_config_name"]
-    if flag and type(flag.CurrentValue) == "string" and flag.CurrentValue ~= "" then
-        return S.configSanitizeName(flag.CurrentValue)
-    end
-
-    local page = S.findRayfieldTabPage("Config")
-    if page then
-        for _, child in ipairs(page:GetChildren()) do
-            if child.Name == "Config Name" then
-                local box = child:FindFirstChild("InputFrame", true)
-                if box then
-                    box = box:FindFirstChild("InputBox")
-                end
-                if box and type(box.Text) == "string" and box.Text ~= "" then
-                    return S.configSanitizeName(box.Text)
-                end
-                break
-            end
-        end
-    end
-
-    return S.configSanitizeName(Config.newName or Config.selectedName or "default")
-end
-
-function S.configGetSelectedName()
-    local flag = Rayfield and Rayfield.Flags and Rayfield.Flags["klze_config_select"]
-    if flag and flag.CurrentOption ~= nil then
-        return S.configSanitizeName(S.resolveDropdownChoice(flag.CurrentOption))
-    end
-    return S.configGetInputName()
-end
-
 function S.configGetFlagValue(flag)
     if not flag then
         return nil
@@ -22451,201 +22404,6 @@ function S.configEnsureFolder()
     return true
 end
 
-function S.configSanitizeName(name)
-    local cleaned = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    cleaned = cleaned:gsub("[^%w%-_ ]", "")
-    cleaned = cleaned:gsub("%s+", "_")
-    if cleaned == "" then
-        return "default"
-    end
-    return cleaned
-end
-
-function S.configGetPath(name)
-    return Config.folder .. "/" .. S.configSanitizeName(name) .. ".json"
-end
-
-function S.configLoadIndex()
-    local names = {}
-    if not S.configHasFileApi() then
-        return names
-    end
-    if typeof(isfile) == "function" and not isfile(Config.indexFile) then
-        return names
-    end
-
-    local readOk, raw = pcall(readfile, Config.indexFile)
-    if not readOk then
-        return names
-    end
-
-    local decodeOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
-    if decodeOk and type(data) == "table" then
-        for _, name in ipairs(data) do
-            if type(name) == "string" and name ~= "" then
-                table.insert(names, S.configSanitizeName(name))
-            end
-        end
-    end
-    return names
-end
-
-function S.configSaveIndex(names)
-    if not S.configHasFileApi() then
-        return
-    end
-    S.configEnsureFolder()
-
-    local unique = {}
-    local cleaned = {}
-    for _, name in ipairs(names) do
-        local safe = S.configSanitizeName(name)
-        if safe ~= "" and not unique[safe] then
-            unique[safe] = true
-            table.insert(cleaned, safe)
-        end
-    end
-    table.sort(cleaned)
-
-    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, cleaned)
-    if ok then
-        pcall(writefile, Config.indexFile, encoded)
-    end
-    return cleaned
-end
-
-function S.configAddToIndex(name)
-    local safe = S.configSanitizeName(name)
-    local names = S.configLoadIndex()
-    if not table.find(names, safe) then
-        table.insert(names, safe)
-    end
-    return S.configSaveIndex(names)
-end
-
-function S.configRemoveFromIndex(name)
-    local safe = S.configSanitizeName(name)
-    local names = S.configLoadIndex()
-    local kept = {}
-    for _, entry in ipairs(names) do
-        if entry ~= safe then
-            table.insert(kept, entry)
-        end
-    end
-    return S.configSaveIndex(kept)
-end
-
-function S.configProfileExists(name)
-    local path = S.configGetPath(name)
-    if typeof(isfile) == "function" then
-        return isfile(path)
-    end
-    local readOk = pcall(readfile, path)
-    return readOk == true
-end
-
-function S.configListNames()
-    if not S.configHasFileApi() then
-        return {}
-    end
-
-    local seen = {}
-    local names = {}
-
-    local function addName(name)
-        local safe = S.configSanitizeName(name)
-        if safe == "" or seen[safe] then
-            return
-        end
-        seen[safe] = true
-        table.insert(names, safe)
-    end
-
-    for _, name in ipairs(S.configLoadIndex()) do
-        addName(name)
-    end
-
-    if typeof(listfiles) == "function" then
-        S.configEnsureFolder()
-
-        local ok, files = pcall(listfiles, Config.folder)
-        if ok and type(files) == "table" then
-            for _, fileName in ipairs(files) do
-                if type(fileName) == "string" then
-                    local base = fileName:match("([^/\\]+)$") or fileName
-                    if base:sub(-5) == ".json" and base ~= "_index.json" and base ~= "autoload.json" then
-                        addName(base:sub(1, -6))
-                    end
-                end
-            end
-        end
-
-        ok, files = pcall(listfiles)
-        if ok and type(files) == "table" then
-            for _, fileName in ipairs(files) do
-                if type(fileName) == "string" then
-                    local matched = fileName:match("^" .. Config.folder:gsub("([^%w])", "%%%1") .. "/([^/\\]+)%.json$")
-                    if matched and matched ~= "_index" and matched ~= "autoload" then
-                        addName(matched)
-                    end
-                end
-            end
-        end
-    end
-
-    local verified = {}
-    for _, name in ipairs(names) do
-        if S.configProfileExists(name) then
-            table.insert(verified, name)
-        end
-    end
-
-    table.sort(verified)
-    if #verified > 0 then
-        S.configSaveIndex(verified)
-    end
-    return verified
-end
-
-function S.configRefreshDropdownOptions()
-    local names = S.configListNames()
-    if #names == 0 then
-        names = { "default" }
-    end
-
-    local selected = S.configGetSelectedName()
-    if not table.find(names, selected) then
-        selected = S.configGetInputName()
-    end
-    if not table.find(names, selected) then
-        selected = names[1]
-    end
-
-    Config.selectedName = selected
-    Config.newName = selected
-
-    local flag = Rayfield and Rayfield.Flags and Rayfield.Flags["klze_config_select"]
-    if flag then
-        if flag.Refresh then
-            pcall(function()
-                flag:Refresh(names)
-            end)
-        else
-            flag.Options = names
-        end
-
-        if flag.Set then
-            pcall(function()
-                flag:Set(selected)
-            end)
-        else
-            flag.CurrentOption = selected
-        end
-    end
-
-    return names, selected
-end
-
 function S.configCapture()
     local payload = {
         version = 2,
@@ -22656,8 +22414,7 @@ function S.configCapture()
 
     if Rayfield and Rayfield.Flags then
         for name, flagObj in pairs(Rayfield.Flags) do
-            if name ~= "klze_config_select" and name ~= "klze_config_autoload" and name ~= "klze_config_name"
-                and not name:match("^terra_upgrade_prio_") then
+            if not name:match("^terra_upgrade_prio_") then
                 local value = S.configGetFlagValue(flagObj)
                 local safe = S.configJsonSafe(value)
                 if safe ~= nil then
@@ -22758,184 +22515,6 @@ function S.configApply(payload)
     end
 
     return true
-end
-
-function S.configSaveProfile(name)
-    if not S.configHasFileApi() then
-        return false, "Executor has no writefile support"
-    end
-    if not Rayfield or not Rayfield.Flags or not next(Rayfield.Flags) then
-        return false, "UI flags not ready yet"
-    end
-    S.configEnsureFolder()
-
-    local profileName = S.configSanitizeName(name or S.configGetSelectedName())
-    local payload = S.configCapture()
-    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
-    if not ok then
-        return false, "Failed to encode config"
-    end
-
-    local writeOk, writeErr = pcall(writefile, S.configGetPath(profileName), encoded)
-    if not writeOk then
-        return false, tostring(writeErr)
-    end
-
-    Config.selectedName = profileName
-    S.configAddToIndex(profileName)
-    S.configRefreshDropdownOptions()
-    return true
-end
-
-function S.configLoadProfile(name)
-    if not S.configHasFileApi() then
-        return false, "Executor has no readfile support"
-    end
-    if not Rayfield or not Rayfield.Flags or not next(Rayfield.Flags) then
-        return false, "UI flags not ready yet"
-    end
-
-    local profileName = S.configSanitizeName(name or S.configGetSelectedName())
-    local path = S.configGetPath(profileName)
-    if typeof(isfile) == "function" and not isfile(path) then
-        return false, "Config not found: " .. profileName
-    end
-
-    local readOk, raw = pcall(readfile, path)
-    if not readOk then
-        return false, tostring(raw)
-    end
-
-    local decodeOk, payload = pcall(HttpService.JSONDecode, HttpService, raw)
-    if not decodeOk then
-        return false, "Invalid config file"
-    end
-
-    local applyOk, applyErr = S.configApply(payload)
-    if not applyOk then
-        return false, applyErr
-    end
-
-    Config.selectedName = profileName
-    S.configRefreshDropdownOptions()
-    return true
-end
-
-function S.configDeleteProfile(name)
-    if not S.configHasFileApi() then
-        return false, "Executor has no file support"
-    end
-
-    local profileName = S.configSanitizeName(name or Config.selectedName)
-    local path = S.configGetPath(profileName)
-
-    if typeof(isfile) == "function" and not isfile(path) then
-        return false, "Config not found: " .. profileName
-    end
-
-    if typeof(delfile) ~= "function" then
-        return false, "Executor has no delfile support"
-    end
-
-    local delOk, delErr = pcall(delfile, path)
-    if not delOk then
-        return false, tostring(delErr)
-    end
-
-    S.configRemoveFromIndex(profileName)
-    S.configRefreshDropdownOptions()
-    return true
-end
-
-function S.configCreateProfile(name)
-    local profileName = S.configSanitizeName(name or S.configGetInputName())
-    Config.selectedName = profileName
-    Config.newName = profileName
-    local ok, err = S.configSaveProfile(profileName)
-    if not ok then
-        return false, err
-    end
-    S.configRefreshDropdownOptions()
-    return true
-end
-
-function S.configSaveAutoloadSettings()
-    if not S.configHasFileApi() then
-        return
-    end
-    S.configEnsureFolder()
-    local payload = {
-        enabled = Config.autoloadEnabled,
-        name = S.configSanitizeName(Config.autoloadName or S.configGetSelectedName()),
-    }
-    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
-    if ok then
-        pcall(writefile, Config.autoloadFile, encoded)
-    end
-end
-
-function S.configLoadAutoloadSettings()
-    if not S.configHasFileApi() then
-        return
-    end
-    if typeof(isfile) == "function" and not isfile(Config.autoloadFile) then
-        return
-    end
-
-    local readOk, raw = pcall(readfile, Config.autoloadFile)
-    if not readOk then
-        return
-    end
-
-    local decodeOk, payload = pcall(HttpService.JSONDecode, HttpService, raw)
-    if not decodeOk or type(payload) ~= "table" then
-        return
-    end
-
-    Config.autoloadEnabled = payload.enabled == true
-    Config.autoloadName = S.configSanitizeName(payload.name or "default")
-end
-
-function S.configSetAutoload(enabled)
-    Config.autoloadEnabled = enabled
-    if enabled then
-        Config.autoloadName = S.configSanitizeName(S.configGetSelectedName())
-    end
-    S.configSaveAutoloadSettings()
-
-    local flag = Rayfield and Rayfield.Flags and Rayfield.Flags["klze_config_autoload"]
-    if flag then
-        flag.CurrentValue = Config.autoloadEnabled
-        if flag.Set then
-            pcall(function()
-                flag:Set(Config.autoloadEnabled)
-            end)
-        end
-    end
-end
-
-function S.configTryAutoload()
-    S.configLoadAutoloadSettings()
-    if not Config.autoloadEnabled then
-        S.hubLog("Autoload OFF - starting with defaults")
-        return
-    end
-
-    local target = S.configSanitizeName(Config.autoloadName or "default")
-    if not S.configProfileExists(target) then
-        S.hubLog("Autoload ON but profile missing: " .. target)
-        S.notify("Config", "Autoload profile not found: " .. target .. " — using defaults", 5)
-        return
-    end
-
-    task.delay(0.6, function()
-        local ok, err = S.configLoadProfile(target)
-        if ok then
-            S.notify("Config", "Autoloaded: " .. target, 4)
-        else
-            S.notify("Config", "Autoload failed: " .. tostring(err), 5)
-        end
-    end)
 end
 
 function S.bindDepthReadout(kind, slider)
@@ -25148,132 +24727,8 @@ function S.buildEspTab(Window)
     })
 end
 
--- Auto Class Requirements: hunts the mobs that class requirements ask for
--- (Bandits, Crazy Miners) and kills them with the normal combat attack.
-local AutoReq = {
-    enabled = false,
-    busy = false,
-    gen = 0,
-    huntRange = 3000,
-    standOff = 7,
-    attackRange = 30,
-    targets = { bandit = true, crazyminer = true },
-    custom = {},
-    _skip = setmetatable({}, { __mode = "k" }),
-}
-
 function S.reqNormalize(text)
     return string.lower(tostring(text or "")):gsub("[^%a%d]", "")
-end
-
-function S.reqMatchesTarget(model)
-    if not S.isHostileMob(model) then
-        return false
-    end
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    local names = {
-        model.Name,
-        model:GetAttribute("DisplayName"),
-        model:GetAttribute("NpcName"),
-        model:GetAttribute("NpcType"),
-        humanoid and humanoid.DisplayName or nil,
-    }
-    for _, raw in ipairs(names) do
-        local n = S.reqNormalize(raw)
-        if n ~= "" then
-            for key in pairs(AutoReq.targets) do
-                if n:find(key, 1, true) then
-                    return true
-                end
-            end
-            for key in pairs(AutoReq.custom) do
-                if n:find(key, 1, true) then
-                    return true
-                end
-            end
-        end
-    end
-    return false
-end
-
-function S.reqFindNearest()
-    local root = S.getRoot()
-    if not root then
-        return nil
-    end
-    local best, bestDist
-    local seen = {}
-    local function consider(model)
-        if not model or seen[model] or (AutoReq._skip[model] or 0) > os.clock() or not S.reqMatchesTarget(model) then
-            return
-        end
-        seen[model] = true
-        local pos = S.getEspWorldPosition(model)
-        if not pos then
-            return
-        end
-        local dist = (pos - root.Position).Magnitude
-        if dist <= AutoReq.huntRange and (not bestDist or dist < bestDist) then
-            best, bestDist = model, dist
-        end
-    end
-    local folder = S.getNpcFolder()
-    if folder then
-        for _, child in ipairs(folder:GetChildren()) do
-            if child:IsA("Model") then
-                consider(child)
-            end
-        end
-    end
-    for _, tagged in ipairs(CollectionService:GetTagged("NpcManager")) do
-        consider(S.getNpcModelFromManager(tagged))
-    end
-    return best, bestDist
-end
-
-function S.reqTick()
-    if AutoReq.busy or Autofarm.miningBusy or Autofarm._oreHuntMode or S.isPlayerDead() then
-        return
-    end
-    local mob = S.reqFindNearest()
-    if not mob then
-        return
-    end
-    AutoReq.busy = true
-    local myGen = AutoReq.gen
-    local ok, err = pcall(function()
-        local killed, stalled = S.huntEngage(mob, {
-            isActive = function()
-                return AutoReq.enabled
-                    and AutoReq.gen == myGen
-                    and not Autofarm.miningBusy
-                    and not S.isPlayerDead()
-            end,
-            recover = true,
-        })
-        if stalled and not killed then
-            AutoReq._skip[mob] = os.clock() + 20
-        end
-    end)
-    AutoReq.busy = false
-    if not ok then
-        warn("[KLZE AutoReq]", err)
-    end
-end
-
-function S.setAutoReq(enabled)
-    AutoReq.enabled = enabled == true
-    AutoReq.gen += 1
-    if not AutoReq.enabled then
-        return
-    end
-    local myGen = AutoReq.gen
-    task.spawn(function()
-        while AutoReq.enabled and AutoReq.gen == myGen do
-            pcall(S.reqTick)
-            task.wait(0.4)
-        end
-    end)
 end
 
 function S.buildCombatTab(Window)
@@ -25336,59 +24791,6 @@ function S.buildCombatTab(Window)
             S.notify("Combat", value and "Face worms: pickaxe client swing ON" or "Face worm auto-kill OFF", 4)
         end,
     })
-
-    CombatTab:CreateSection("Class Requirements")
-
-    CombatTab:CreateParagraph({
-        Title = "Auto Class Requirements",
-        Content = "Finds and kills Bandits and Crazy Miners for class requirements. Pauses while mining.",
-    })
-
-    CombatTab:CreateToggle({
-        Name = "Auto Class Requirements",
-        CurrentValue = false,
-        Flag = "terra_auto_class_req",
-        Callback = function(value)
-            S.setAutoReq(value)
-            S.notify("Combat", value and "Auto class requirements ON" or "Auto class requirements OFF", 3)
-        end,
-    })
-
-    CombatTab:CreateToggle({
-        Name = "Hunt Bandits",
-        CurrentValue = true,
-        Flag = "terra_auto_req_bandit",
-        Callback = function(value)
-            AutoReq.targets.bandit = value == true or nil
-        end,
-    })
-
-    CombatTab:CreateToggle({
-        Name = "Hunt Crazy Miners",
-        CurrentValue = true,
-        Flag = "terra_auto_req_crazyminer",
-        Callback = function(value)
-            AutoReq.targets.crazyminer = value == true or nil
-        end,
-    })
-
-    CombatTab:CreateInput({
-        Name = "Extra Targets",
-        PlaceholderText = "names separated by commas, e.g. skeleton, goblin",
-        RemoveTextAfterFocusLost = false,
-        Flag = "terra_auto_req_custom",
-        Callback = function(text)
-            AutoReq.custom = {}
-            for part in tostring(text or ""):gmatch("[^,]+") do
-                local key = S.reqNormalize(part)
-                if key ~= "" then
-                    AutoReq.custom[key] = true
-                end
-            end
-        end,
-    })
-
-    S.addHuntControls(CombatTab, "_combat")
 
     CombatTab:CreateSection("Defense")
 
@@ -25777,148 +25179,6 @@ function S.buildPlayerTab(Window)
     S.startKeybindListener()
 end
 
-function S.buildConfigTab(Window)
-    local ConfigTab = Window:CreateTab("Config")
-    ConfigTab:CreateSection("Profiles")
-
-    local initialNames = S.configListNames()
-    if #initialNames == 0 then
-        table.insert(initialNames, "default")
-    end
-    if not table.find(initialNames, Config.selectedName) then
-        Config.selectedName = initialNames[1]
-    end
-
-    S.configLoadAutoloadSettings()
-
-    local configNameInput = ConfigTab:CreateInput({
-        Name = "Config Name",
-        PlaceholderText = "default",
-        RemoveTextAfterFocusLost = false,
-        Flag = "klze_config_name",
-        Callback = function(text)
-            Config.newName = S.configSanitizeName(text)
-            Config.selectedName = Config.newName
-        end,
-    })
-    S.registerRayfieldFlag(configNameInput)
-
-    local configDropdown = ConfigTab:CreateDropdown({
-        Name = "Saved Configs",
-        Options = initialNames,
-        CurrentOption = Config.selectedName,
-        Flag = "klze_config_select",
-        Callback = function(option)
-            Config.selectedName = S.configSanitizeName(S.resolveDropdownChoice(option))
-            Config.newName = Config.selectedName
-        end,
-    })
-    S.registerRayfieldFlag(configDropdown)
-
-    ConfigTab:CreateButton({
-        Name = "Refresh List",
-        Callback = function()
-            local names = S.configRefreshDropdownOptions()
-            if #names == 0 then
-                S.notify("Config", "No saved configs yet", 3)
-            else
-                S.notify("Config", "Configs: " .. table.concat(names, ", "), 4)
-            end
-        end,
-    })
-
-    ConfigTab:CreateButton({
-        Name = "Create Config",
-        Callback = function()
-            local name = S.configGetInputName()
-            local ok, err = S.configCreateProfile(name)
-            if ok then
-                local names = S.configRefreshDropdownOptions()
-                S.notify("Config", "Created: " .. name .. " (" .. #names .. " total)", 4)
-            else
-                S.notify("Config", tostring(err), 5)
-            end
-        end,
-    })
-
-    ConfigTab:CreateButton({
-        Name = "Save Config",
-        Callback = function()
-            local name = S.configGetSelectedName()
-            local ok, err = S.configSaveProfile(name)
-            if ok then
-                local names = S.configRefreshDropdownOptions()
-                S.notify("Config", "Saved: " .. name .. " (" .. #names .. " total)", 4)
-            else
-                S.notify("Config", tostring(err), 5)
-            end
-        end,
-    })
-
-    ConfigTab:CreateButton({
-        Name = "Load Config",
-        Callback = function()
-            local name = S.configGetSelectedName()
-            local ok, err = S.configLoadProfile(name)
-            if ok then
-                S.notify("Config", "Loaded: " .. name, 3)
-            else
-                S.notify("Config", tostring(err), 5)
-            end
-        end,
-    })
-
-    ConfigTab:CreateButton({
-        Name = "Delete Config",
-        Callback = function()
-            local name = S.configGetSelectedName()
-            local ok, err = S.configDeleteProfile(name)
-            if ok then
-                S.notify("Config", "Deleted: " .. name, 3)
-            else
-                S.notify("Config", tostring(err), 5)
-            end
-        end,
-    })
-
-    ConfigTab:CreateSection("Autoload")
-
-    ConfigTab:CreateParagraph({
-        Title = "Default behavior",
-        Content = "With Autoload OFF the hub starts on defaults. Select a config and press Load Config when you want.",
-    })
-
-    local autoloadToggle = ConfigTab:CreateToggle({
-        Name = "Autoload Selected Config",
-        CurrentValue = Config.autoloadEnabled,
-        Flag = "klze_config_autoload",
-        Callback = function(value)
-            S.configSetAutoload(value)
-            if value then
-                Config.autoloadName = S.configGetSelectedName()
-                S.configSaveAutoloadSettings()
-                S.notify("Config", "Autoload ON: " .. Config.autoloadName, 3)
-            else
-                S.notify("Config", "Autoload OFF - next run uses defaults", 3)
-            end
-        end,
-    })
-    S.registerRayfieldFlag(autoloadToggle)
-
-    ConfigTab:CreateButton({
-        Name = "Set Autoload To Selected",
-        Callback = function()
-            Config.autoloadName = S.configGetSelectedName()
-            S.configSaveAutoloadSettings()
-            S.notify("Config", "Autoload target: " .. Config.autoloadName, 3)
-        end,
-    })
-
-    task.defer(function()
-        S.configRefreshDropdownOptions()
-    end)
-end
-
 function S.coreBootAutoload()
     pcall(S.corePullLoadedFlags)
     if game.PlaceId ~= KLZE.placeId then
@@ -26038,7 +25298,7 @@ function S.huntSwing(tool, mob)
 end
 
 -- opts.isActive(): devuelve false para abortar. opts.recover: sacar al
--- jugador de debajo del suelo al terminar (modo Under fuera de Drill Main).
+-- jugador de debajo del suelo al terminar (modo Under fuera de Auto Bounty Hunter).
 -- Devuelve killed, stalled.
 function S.huntEngage(mob, opts)
     opts = opts or {}
@@ -26186,7 +25446,7 @@ function S.huntEngage(mob, opts)
     return killed, stalled
 end
 
--- Controles compartidos (Combat y Drill Main). `suffix` evita flags duplicados.
+-- Controles compartidos (Combat y Auto Bounty Hunter). `suffix` evita flags duplicados.
 function S.addHuntControls(tab, suffix)
     local H = S.Hunt
     tab:CreateDropdown({
@@ -26234,7 +25494,7 @@ function S.addHuntControls(tab, suffix)
 end
 
 -- ============================================================
--- Drill Main: viaja (noclip) hasta el final del mapa, ataca
+-- Auto Bounty Hunter: viaja (noclip) hasta el final del mapa, ataca
 -- Bandits / Crazy Miners (cualquier mutación) con la mejor arma,
 -- vuelve al taladro al terminar cada vuelta y cuenta las bajas.
 -- ============================================================
@@ -26562,7 +25822,7 @@ function S.dmNewMatch(myGen)
         end
     end)
     pcall(S.coreSaveQueue)
-    S.notify("Drill Main", "Iniciando otra partida...", 5)
+    S.notify("Auto Bounty Hunter", "Iniciando otra partida...", 5)
     local svc = S.coreTeleportService()
     if svc and type(svc.TeleportToLobby) == "function" then
         pcall(function()
@@ -26617,7 +25877,7 @@ task.spawn(function()
         end
     end)
     S.setDrillMain(true)
-    S.notify("Drill Main", "Nueva partida: Run activado", 5)
+    S.notify("Auto Bounty Hunter", "Nueva partida: Run activado", 5)
 end)
 
 function S.setDrillMain(enabled)
@@ -26685,7 +25945,7 @@ function S.setDrillMain(enabled)
                     flag:Set(false)
                 end
             end)
-            S.notify("Drill Main", done .. "/" .. total .. " laps · " .. S.dmSummary(), 10)
+            S.notify("Auto Bounty Hunter", done .. "/" .. total .. " laps · " .. S.dmSummary(), 10)
             if DM.autoRestart and done >= total then
                 S.dmNewMatch(myGen)
             end
@@ -26695,8 +25955,8 @@ end
 
 function S.buildDrillMainTab(Window)
     local DM = S.DrillMain
-    local tab = Window:CreateTab("Drill Main")
-    tab:CreateSection("Drill Main")
+    local tab = Window:CreateTab("Auto Bounty Hunter")
+    tab:CreateSection("Auto Bounty Hunter")
 
     tab:CreateToggle({
         Name = "Run",
@@ -26704,7 +25964,7 @@ function S.buildDrillMainTab(Window)
         Flag = "terra_drillmain_run",
         Callback = function(value)
             S.setDrillMain(value == true)
-            S.notify("Drill Main", value and ("Run ON · " .. DM.laps .. " laps") or "Run OFF", 3)
+            S.notify("Auto Bounty Hunter", value and ("Run ON · " .. DM.laps .. " laps") or "Run OFF", 3)
         end,
     })
 
@@ -26759,11 +26019,282 @@ function S.buildDrillMainTab(Window)
     })
 
     tab:CreateParagraph({
-        Title = "Drill Main",
+        Title = "Auto Bounty Hunter",
         Content = "Run: recorre el mapa atravesando paredes, mata Bandits y Crazy Miners (ignora los Stone) con tu mejor arma, vuelve al taladro en cada lap y al final muestra las bajas y empieza otra partida.",
     })
 end
 
+
+-- ============================================================
+-- Misc: Anti-AFK + settings persistentes + auto-ejecución por partida
+--  * Autoguardado: cada cambio de la UI se guarda en
+--    klze_hub_configs/_autosave.json (y al teletransportarse).
+--  * Al iniciar el script se restaura solo y se reanuda el farm.
+--  * Auto-ejecución: queue_on_teleport relanza el script al entrar
+--    a la siguiente partida (nueva partida / lobby / rejoin).
+-- ============================================================
+S.Misc = {
+    autosave = true,
+    autoexec = true,
+    antiAfk = true,
+    source = "main1.lua", -- URL (https://...) o archivo en la carpeta workspace del executor
+    file = "klze_hub_configs/_autosave.json",
+    _lastEncoded = nil,
+    _queued = false,
+}
+
+function S.miscQueueFn()
+    if typeof(queue_on_teleport) == "function" then
+        return queue_on_teleport
+    end
+    if type(syn) == "table" and typeof(syn.queue_on_teleport) == "function" then
+        return syn.queue_on_teleport
+    end
+    if type(fluxus) == "table" and typeof(fluxus.queue_on_teleport) == "function" then
+        return fluxus.queue_on_teleport
+    end
+    return nil
+end
+
+function S.miscGetSource()
+    if typeof(getgenv) == "function" then
+        local forced = getgenv().KLZE_SCRIPT_SOURCE
+        if type(forced) == "string" and forced ~= "" then
+            return forced
+        end
+    end
+    local src = tostring(S.Misc.source or "")
+    src = src:gsub("^%s+", ""):gsub("%s+$", "")
+    return src
+end
+
+function S.miscQueueReload(force)
+    local Misc = S.Misc
+    if not Misc.autoexec then
+        return false, "auto-exec OFF"
+    end
+    if Misc._queued and not force then
+        return true
+    end
+    local queue = S.miscQueueFn()
+    if not queue then
+        return false, "executor sin queue_on_teleport"
+    end
+    local src = S.miscGetSource()
+    if src == "" then
+        return false, "falta la ruta/URL del script"
+    end
+    local stub = string.format([[
+if not game:IsLoaded() then game.Loaded:Wait() end
+local src = %q
+local ok, code
+if src:match("^https?://") then
+    ok, code = pcall(function() return game:HttpGet(src, true) end)
+else
+    ok, code = pcall(readfile, src)
+end
+if ok and type(code) == "string" and code ~= "" then
+    local fn, err = loadstring(code)
+    if fn then fn() else warn("[KLZE] autoexec: " .. tostring(err)) end
+else
+    warn("[KLZE] autoexec: no pude leer " .. src)
+end
+]], src)
+    local okQ, errQ = pcall(queue, stub)
+    if not okQ then
+        return false, tostring(errQ)
+    end
+    Misc._queued = true
+    return true
+end
+
+function S.miscSave(force)
+    local Misc = S.Misc
+    if not S.configHasFileApi() then
+        return false
+    end
+    if S._configLoading or not S._uiReady then
+        return false
+    end
+    if not Rayfield or not Rayfield.Flags or not next(Rayfield.Flags) then
+        return false
+    end
+    local okCap, payload = pcall(S.configCapture)
+    if not okCap or type(payload) ~= "table" then
+        return false
+    end
+    payload.savedAt = nil -- que no cambie solo por la hora
+    local okEnc, encoded = pcall(HttpService.JSONEncode, HttpService, payload)
+    if not okEnc then
+        return false
+    end
+    if not force and encoded == Misc._lastEncoded then
+        return true
+    end
+    S.configEnsureFolder()
+    local okW = pcall(writefile, Misc.file, encoded)
+    if okW then
+        Misc._lastEncoded = encoded
+    end
+    return okW
+end
+
+function S.miscRestore()
+    if not S.configHasFileApi() then
+        return false
+    end
+    if typeof(isfile) == "function" and not isfile(S.Misc.file) then
+        return false
+    end
+    local okR, raw = pcall(readfile, S.Misc.file)
+    if not okR or type(raw) ~= "string" or raw == "" then
+        return false
+    end
+    local okD, payload = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not okD or type(payload) ~= "table" then
+        return false
+    end
+    local deadline = os.clock() + 10
+    while (not Rayfield or not Rayfield.Flags or not next(Rayfield.Flags)) and os.clock() < deadline do
+        task.wait(0.2)
+    end
+    S._configLoading = true
+    local okA, errA = pcall(S.configApply, payload)
+    task.wait(0.4)
+    S._configLoading = false
+    if not okA then
+        S.hubLog("Misc restore error: " .. tostring(errA))
+        return false
+    end
+    S.Misc._lastEncoded = raw
+    S.hubLog("Settings restaurados desde _autosave.json")
+    return true
+end
+
+function S.miscBoot()
+    local restored = pcall(S.miscRestore)
+    pcall(S.corePullLoadedFlags)
+    pcall(S.coreBootAutoload) -- reanuda farm / lobby con los flags ya restaurados
+
+    if S.Misc.antiAfk and S._klzeHub and S._klzeHub.setAntiAfk then
+        pcall(S._klzeHub.setAntiAfk, true)
+    end
+    local okQ, errQ = S.miscQueueReload()
+    if not okQ and S.Misc.autoexec then
+        S.notify("Misc", "Auto-ejecución no activa: " .. tostring(errQ), 6)
+    end
+
+    local gen = (typeof(getgenv) == "function" and ((getgenv().__KLZE_MISC_GEN or 0) + 1)) or 1
+    if typeof(getgenv) == "function" then
+        getgenv().__KLZE_MISC_GEN = gen
+    end
+    task.spawn(function()
+        while true do
+            task.wait(4)
+            if typeof(getgenv) == "function" and getgenv().__KLZE_MISC_GEN ~= gen then
+                return
+            end
+            if S.Misc.autosave then
+                pcall(S.miscSave, false)
+            end
+        end
+    end)
+
+    local player = LocalPlayer or Players.LocalPlayer
+    if player then
+        player.OnTeleport:Connect(function()
+            if S.Misc.autosave then
+                pcall(S.miscSave, true)
+            end
+            pcall(S.miscQueueReload, false)
+        end)
+    end
+    Players.PlayerRemoving:Connect(function(p)
+        if p == player and S.Misc.autosave then
+            pcall(S.miscSave, true)
+        end
+    end)
+end
+
+function S.buildMiscTab(Window)
+    local Misc = S.Misc
+    local tab = Window:CreateTab("Misc")
+    S._miscBuilt = true
+
+    tab:CreateSection("Anti AFK")
+    tab:CreateToggle({
+        Name = "Anti AFK",
+        CurrentValue = Misc.antiAfk,
+        Flag = "klze_misc_antiafk",
+        Callback = function(value)
+            Misc.antiAfk = value == true
+            if S._klzeHub and S._klzeHub.setAntiAfk then
+                pcall(S._klzeHub.setAntiAfk, Misc.antiAfk)
+            end
+        end,
+    })
+    if S._klzeHub and S._klzeHub.setAntiAfk then
+        pcall(S._klzeHub.setAntiAfk, Misc.antiAfk)
+    end
+
+    tab:CreateSection("Partida tras partida")
+    tab:CreateToggle({
+        Name = "Guardar settings automáticamente",
+        CurrentValue = Misc.autosave,
+        Flag = "klze_misc_autosave",
+        Callback = function(value)
+            Misc.autosave = value == true
+            if Misc.autosave then
+                pcall(S.miscSave, true)
+            end
+        end,
+    })
+    tab:CreateToggle({
+        Name = "Auto-ejecutar en cada partida",
+        CurrentValue = Misc.autoexec,
+        Flag = "klze_misc_autoexec",
+        Callback = function(value)
+            Misc.autoexec = value == true
+            if Misc.autoexec and S._uiReady then
+                local ok, err = S.miscQueueReload(false)
+                if not ok then
+                    S.notify("Misc", tostring(err), 5)
+                end
+            end
+        end,
+    })
+    tab:CreateInput({
+        Name = "Script (archivo o URL)",
+        PlaceholderText = Misc.source,
+        RemoveTextAfterFocusLost = false,
+        Flag = "klze_misc_source",
+        Callback = function(text)
+            text = tostring(text or "")
+            if text ~= "" then
+                Misc.source = text
+                Misc._queued = false
+            end
+        end,
+    })
+    tab:CreateButton({
+        Name = "Guardar ahora",
+        Callback = function()
+            local ok = S.miscSave(true)
+            S.notify("Misc", ok and "Settings guardados" or "No se pudo guardar", 3)
+        end,
+    })
+    tab:CreateButton({
+        Name = "Probar auto-ejecución",
+        Callback = function()
+            local ok, err = S.miscQueueReload(true)
+            S.notify("Misc", ok and ("Listo: se ejecutará en la próxima partida · " .. S.miscGetSource()) or tostring(err), 6)
+        end,
+    })
+    tab:CreateParagraph({
+        Title = "Cómo funciona",
+        Content = "Tus settings se guardan solos y se restauran al entrar a otra partida; si dejaste el farm activo, se reanuda. Para la auto-ejecución pon en 'Script' el nombre del archivo en la carpeta workspace de tu executor (ej. main1.lua) o la URL de tu loadstring.",
+    })
+end
 
 function S.buildUI()
     S._configLoading = true
@@ -26780,7 +26311,7 @@ function S.buildUI()
         end
     end
 
-    safeTab("Drill Main", function()
+    safeTab("Auto Bounty Hunter", function()
         S.buildDrillMainTab(Window)
     end)
     safeTab("Lobby", function()
@@ -26813,6 +26344,9 @@ function S.buildUI()
     safeTab("Shop", function()
         S.buildAutoBuyTab(Window)
     end)
+    safeTab("Misc", function()
+        S.buildMiscTab(Window)
+    end)
 
     pcall(function()
         if S._klzeHub and S._klzeHub.complete then
@@ -26829,7 +26363,7 @@ function S.buildUI()
     S._configLoading = false
     task.defer(function()
         S._configLoading = false
-        pcall(S.coreBootAutoload)
+        pcall(S.miscBoot)
     end)
     S.hubLog("UI ready")
     pcall(function()
