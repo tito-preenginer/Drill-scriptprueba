@@ -25159,6 +25159,7 @@ local AutoReq = {
     attackRange = 30,
     targets = { bandit = true, crazyminer = true },
     custom = {},
+    _skip = setmetatable({}, { __mode = "k" }),
 }
 
 function S.reqNormalize(text)
@@ -25203,7 +25204,7 @@ function S.reqFindNearest()
     local best, bestDist
     local seen = {}
     local function consider(model)
-        if not model or seen[model] or not S.reqMatchesTarget(model) then
+        if not model or seen[model] or (AutoReq._skip[model] or 0) > os.clock() or not S.reqMatchesTarget(model) then
             return
         end
         seen[model] = true
@@ -25234,28 +25235,25 @@ function S.reqTick()
     if AutoReq.busy or Autofarm.miningBusy or Autofarm._oreHuntMode or S.isPlayerDead() then
         return
     end
-    local mob, dist = S.reqFindNearest()
+    local mob = S.reqFindNearest()
     if not mob then
         return
     end
     AutoReq.busy = true
+    local myGen = AutoReq.gen
     local ok, err = pcall(function()
-        local root = S.getRoot()
-        local pos = S.getEspWorldPosition(mob)
-        if not root or not pos then
-            return
+        local killed, stalled = S.huntEngage(mob, {
+            isActive = function()
+                return AutoReq.enabled
+                    and AutoReq.gen == myGen
+                    and not Autofarm.miningBusy
+                    and not S.isPlayerDead()
+            end,
+            recover = true,
+        })
+        if stalled and not killed then
+            AutoReq._skip[mob] = os.clock() + 20
         end
-        if Combat.autoEquipBestDamage then
-            S.ensureBestDamageTool()
-        end
-        if dist > AutoReq.attackRange then
-            local dir = root.Position - pos
-            dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
-            root.CFrame = CFrame.new(pos + dir * AutoReq.standOff)
-            root.AssemblyLinearVelocity = Vector3.zero
-            S.requestStreamAround(pos, 0.3)
-        end
-        S.combatAttack()
     end)
     AutoReq.busy = false
     if not ok then
@@ -25389,6 +25387,8 @@ function S.buildCombatTab(Window)
             end
         end,
     })
+
+    S.addHuntControls(CombatTab, "_combat")
 
     CombatTab:CreateSection("Defense")
 
@@ -25942,6 +25942,298 @@ function S.coreBootAutoload()
 end
 
 -- ============================================================
+-- Hunt Engage: remata a un mob hasta que muera.
+--  * Elige SIEMPRE la espada/pico con más daño (ignora armas de fuego).
+--  * Autoclicker: Swing remoto directo al mob + Tool:Activate + click virtual.
+--  * Dodge method: Off (de frente) | Under (debajo) | Up (encima).
+--  * Se pega al mob cada frame y, si no le hace daño, cambia a "Off" y
+--    al final lo salta un rato para no quedarse atascado.
+-- ============================================================
+S.Hunt = {
+    method = "Under", -- "Off" | "Under" | "Up"
+    underDepth = 4, -- studs por debajo de los pies del mob
+    upHeight = 4, -- studs por encima de la cabeza del mob
+    standOff = 6, -- distancia en modo Off
+    autoClick = true,
+    clickInterval = 0.12,
+    stallSeconds = 12, -- sin hacerle daño durante este tiempo -> se rinde
+    range = 60, -- Range que se le pone al arma
+}
+
+-- Mejor espada o pico por daño total.
+function S.huntBestMelee()
+    local best, bestDamage = nil, -1
+    local function scan(container)
+        if not container then
+            return
+        end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Tool") and (S.isSwordTool(child) or S.isPickaxeTool(child)) then
+                local damage = S.getToolDamage(child)
+                if damage > bestDamage then
+                    best, bestDamage = child, damage
+                end
+            end
+        end
+    end
+    scan(LocalPlayer.Character)
+    scan(LocalPlayer:FindFirstChildOfClass("Backpack"))
+    return best, bestDamage
+end
+
+function S.huntEquip(tool)
+    if not tool or not Services.ToolService then
+        return false
+    end
+    if S.getEquippedTool() == tool then
+        return true
+    end
+    pcall(S.callEquipTool, tool)
+    return S.getEquippedTool() == tool
+end
+
+function S.huntHealth(mob, humanoid)
+    if humanoid and humanoid.Parent then
+        return humanoid.Health
+    end
+    local h = mob and mob:FindFirstChildOfClass("Humanoid")
+    if h then
+        return h.Health
+    end
+    local attr = mob and mob:GetAttribute("Health")
+    if typeof(attr) == "number" then
+        return attr
+    end
+    return nil
+end
+
+function S.huntAlive(mob, humanoid)
+    if not mob or not mob.Parent then
+        return false
+    end
+    local health = S.huntHealth(mob, humanoid)
+    if health ~= nil then
+        return health > 0
+    end
+    return true
+end
+
+-- Un "clic": Swing remoto al mob + Activate + clic virtual.
+function S.huntSwing(tool, mob)
+    local H = S.Hunt
+    pcall(function()
+        Services.ToolService.Update:Fire({ "Swing", { mob } })
+    end)
+    if H.autoClick then
+        pcall(function()
+            tool:Activate()
+        end)
+        pcall(function()
+            local vu = game:GetService("VirtualUser")
+            local cam = Workspace.CurrentCamera
+            vu:CaptureController()
+            vu:ClickButton1(Vector2.new(0, 0), cam and cam.CFrame or CFrame.new())
+        end)
+    end
+end
+
+-- opts.isActive(): devuelve false para abortar. opts.recover: sacar al
+-- jugador de debajo del suelo al terminar (modo Under fuera de Drill Main).
+-- Devuelve killed, stalled.
+function S.huntEngage(mob, opts)
+    opts = opts or {}
+    local H = S.Hunt
+    local isActive = opts.isActive or function()
+        return true
+    end
+    local humanoid = mob:FindFirstChildOfClass("Humanoid")
+
+    local tool = S.huntBestMelee()
+    if tool then
+        S.huntEquip(tool)
+    else
+        pcall(S.ensureBestDamageTool)
+        tool = S.getEquippedTool()
+    end
+    if not tool then
+        return false, false
+    end
+
+    -- Atravesar paredes + no caerse mientras estamos pegados al mob.
+    local ownedNoclip = false
+    if not State.noclip then
+        S.setNoclip(true)
+        ownedNoclip = true
+    end
+    local myHum = S.getHumanoid()
+    local hadPlatform = myHum and myHum.PlatformStand or false
+    if myHum then
+        pcall(function()
+            myHum.PlatformStand = true
+        end)
+    end
+
+    local startPos = S.getEspWorldPosition(mob)
+    local root = S.getRoot()
+    if root and startPos and (startPos - root.Position).Magnitude > 200 then
+        root.CFrame = CFrame.new(startPos + Vector3.new(0, 20, 0))
+        root.AssemblyLinearVelocity = Vector3.zero
+        pcall(S.requestStreamAround, startPos, 0.3)
+    end
+
+    local healthNow = S.huntHealth(mob, humanoid)
+    local lastHealth = healthNow
+    local lastProgress = os.clock()
+    local lastSwing = 0
+    local usedUnder = false
+    local lastStreamPos = startPos
+    local stalled = false
+
+    while isActive() do
+        if S.isPlayerDead() or not S.huntAlive(mob, humanoid) then
+            break
+        end
+        root = S.getRoot()
+        local mobPos = S.getEspWorldPosition(mob)
+        if not root or not mobPos then
+            break
+        end
+        local now = os.clock()
+
+        -- Sin daño a mitad del timeout: probar de frente (Off).
+        local method = H.method
+        if now - lastProgress > H.stallSeconds * 0.5 then
+            method = "Off"
+        end
+
+        local targetPos
+        local keepRotation = true
+        if method == "Under" then
+            targetPos = S.getMobUnderPosition(mob, H.underDepth)
+            usedUnder = true
+        elseif method == "Up" then
+            targetPos = S.getMobAbovePosition(mob, H.upHeight)
+        else
+            local flat = Vector3.new(root.Position.X - mobPos.X, 0, root.Position.Z - mobPos.Z)
+            flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(1, 0, 0)
+            targetPos = mobPos + flat * H.standOff
+            keepRotation = false
+        end
+
+        if targetPos then
+            if keepRotation then
+                root.CFrame = CFrame.new(targetPos) * (root.CFrame - root.CFrame.Position)
+            else
+                root.CFrame = CFrame.lookAt(targetPos, Vector3.new(mobPos.X, targetPos.Y, mobPos.Z))
+            end
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            if method == "Under" then
+                Combat.underActive = true
+                Combat.underLastSafeXZ = Vector3.new(targetPos.X, 0, targetPos.Z)
+            end
+        end
+
+        if lastStreamPos and (mobPos - lastStreamPos).Magnitude > 150 then
+            lastStreamPos = mobPos
+            task.spawn(S.requestStreamAround, mobPos, 0.2)
+        end
+
+        -- Reequipar si se soltó el arma (muerte, otro script, etc.).
+        if S.getEquippedTool() ~= tool then
+            S.huntEquip(tool)
+        end
+        if now - lastSwing >= H.clickInterval then
+            lastSwing = now
+            S.boostToolRange(tool, H.range)
+            S.huntSwing(tool, mob)
+        end
+
+        -- Vigilar que de verdad le estamos haciendo daño.
+        local h = S.huntHealth(mob, humanoid)
+        if h ~= nil and lastHealth ~= nil and h < lastHealth - 0.01 then
+            lastProgress = now
+        end
+        if h ~= nil then
+            lastHealth = h
+        end
+        local limit = (h ~= nil) and H.stallSeconds or 30
+        if now - lastProgress > limit then
+            stalled = true
+            break
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    local killed = not S.huntAlive(mob, humanoid)
+
+    -- Restaurar estado.
+    local rootEnd = S.getRoot()
+    if usedUnder and opts.recover and rootEnd then
+        S.recoverFromUnder(rootEnd)
+    end
+    Combat.underActive = false
+    if ownedNoclip then
+        S.setNoclip(false)
+    end
+    if myHum and not hadPlatform and opts.recover then
+        pcall(function()
+            myHum.PlatformStand = false
+        end)
+    end
+
+    return killed, stalled
+end
+
+-- Controles compartidos (Combat y Drill Main). `suffix` evita flags duplicados.
+function S.addHuntControls(tab, suffix)
+    local H = S.Hunt
+    tab:CreateDropdown({
+        Name = "Dodge Method",
+        Options = { "Under", "Up", "Off" },
+        CurrentOption = { H.method },
+        MultipleOptions = false,
+        Flag = "terra_hunt_method" .. suffix,
+        Callback = function(option)
+            local mode = S.resolveDropdownChoice(option)
+            if mode ~= "Under" and mode ~= "Up" and mode ~= "Off" then
+                mode = "Under"
+            end
+            H.method = mode
+        end,
+    })
+    tab:CreateSlider({
+        Name = "Under Depth (studs)",
+        Range = { 2, 12 },
+        Increment = 1,
+        CurrentValue = H.underDepth,
+        Flag = "terra_hunt_under" .. suffix,
+        Callback = function(value)
+            H.underDepth = math.clamp(tonumber(value) or 4, 2, 12)
+        end,
+    })
+    tab:CreateSlider({
+        Name = "Up Height (studs)",
+        Range = { 2, 12 },
+        Increment = 1,
+        CurrentValue = H.upHeight,
+        Flag = "terra_hunt_up" .. suffix,
+        Callback = function(value)
+            H.upHeight = math.clamp(tonumber(value) or 4, 2, 12)
+        end,
+    })
+    tab:CreateToggle({
+        Name = "Autoclicker (best sword/pickaxe)",
+        CurrentValue = H.autoClick,
+        Flag = "terra_hunt_autoclick" .. suffix,
+        Callback = function(value)
+            H.autoClick = value == true
+        end,
+    })
+end
+
+-- ============================================================
 -- Drill Main: viaja (noclip) hasta el final del mapa, ataca
 -- Bandits / Crazy Miners (cualquier mutación) con la mejor arma,
 -- vuelve al taladro al terminar cada vuelta y cuenta las bajas.
@@ -26104,43 +26396,22 @@ function S.dmCountKill(model, kind)
     S.dmUpdateStatus()
 end
 
--- Ataca al mob con la mejor arma hasta que muera (sin límite de tiempo).
+-- Ataca al mob con la mejor espada/pico (autoclicker + Under/Up) hasta que muera.
 function S.dmFight(mob, kind, myGen)
     local DM = S.DrillMain
-    local humanoid = mob:FindFirstChildOfClass("Humanoid")
     if S.dmIsStone(mob, true) then
         return false
     end
-    local prevRange = Combat.auraRange
-    Combat.auraRange = math.max(tonumber(prevRange) or 50, 60)
-    local killed = false
-    while DM.enabled and DM.gen == myGen do
-        if S.isPlayerDead() then
-            break
-        end
-        if not mob.Parent or not humanoid or humanoid.Health <= 0 then
-            killed = true
-            break
-        end
-        local root = S.getRoot()
-        local pos = S.getEspWorldPosition(mob)
-        if not root or not pos then
-            break
-        end
-        if (pos - root.Position).Magnitude > DM.attackRange then
-            local dir = root.Position - pos
-            dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
-            root.CFrame = CFrame.new(pos + dir * DM.standOff)
-            root.AssemblyLinearVelocity = Vector3.zero
-            task.spawn(S.requestStreamAround, pos, 0.2)
-        end
-        pcall(S.ensureBestDamageTool)
-        pcall(S.combatAttack)
-        task.wait(0.15)
-    end
-    Combat.auraRange = prevRange
+    local killed, stalled = S.huntEngage(mob, {
+        isActive = function()
+            return DM.enabled and DM.gen == myGen
+        end,
+        recover = false,
+    })
     if killed then
         S.dmCountKill(mob, kind)
+    elseif stalled then
+        DM._skip[mob] = os.clock() + 20
     end
     return killed
 end
@@ -26479,6 +26750,8 @@ function S.buildDrillMainTab(Window)
             S.dmSaveState(false)
         end,
     })
+
+    S.addHuntControls(tab, "_dm")
 
     DM._status = tab:CreateStatusLabel({
         Name = "Status",
