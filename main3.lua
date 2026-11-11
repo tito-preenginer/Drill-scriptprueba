@@ -23146,6 +23146,9 @@ CoreFarm = {
     instantOpen = false, -- skip the hold-E cooldown
     pickUp = false, -- auto pick up Void / King / Phoenix / Revive Kit
     pickTypes = { "Void", "King", "Phoenix", "Revive Kit" },
+    pickGear = false, -- pick up Sword / Armor / Gun worth more than pickGearMin coins
+    pickGearMin = 2000,
+    church = false, -- before leaving the run, go to the church and save gears
 }
 
 S.CORE_PICK_OPTIONS = { "Void", "King", "Phoenix", "Revive Kit" }
@@ -23204,6 +23207,9 @@ function S.coreSaveQueue()
         instantOpen = CoreFarm.instantOpen == true,
         pickUp = CoreFarm.pickUp == true,
         pickTypes = CoreFarm.pickTypes,
+        pickGear = CoreFarm.pickGear == true,
+        pickGearMin = CoreFarm.pickGearMin,
+        church = CoreFarm.church == true,
     }
     pcall(writefile, CORE_FILE, HttpService:JSONEncode(payload))
 end
@@ -23241,6 +23247,28 @@ function S.coreLoadQueue()
     if type(data.pickTypes) == "table" then
         CoreFarm.pickTypes = data.pickTypes
     end
+    CoreFarm.pickGear = data.pickGear == true
+    CoreFarm.pickGearMin = tonumber(data.pickGearMin) or 2000
+    CoreFarm.church = data.church == true
+end
+
+-- Shared by the Core tab and the Auto Bounty Hunter tab (same state, two switches).
+function S.setPickGear(value, fromFlag)
+    if S._pickGearSyncing then
+        return
+    end
+    CoreFarm.pickGear = value == true
+    if CoreFarm.pickGear then
+        S.coreStartPickupLoop()
+    end
+    S._pickGearSyncing = true
+    for _, flagName in ipairs({ "dtec_core_pick_gear", "terra_drillmain_pickgear" }) do
+        if flagName ~= fromFlag then
+            pcall(S.trySetRayfieldFlag, flagName, CoreFarm.pickGear, true)
+        end
+    end
+    S._pickGearSyncing = false
+    S.coreSaveQueue()
 end
 
 -- ===== Core: Pick Up (Void / King / Phoenix / Revive Kit) =====
@@ -23254,6 +23282,44 @@ function S.corePickWants(label)
 end
 
 -- Returns the matching group label ("Void", "King", "Phoenix", "Revive Kit") or nil.
+-- "Sword" / "Armor" / "Gun" for real gear, nil for everything else (ores, bars,
+-- consumables, pickaxes, tools...).
+function S.coreGearCategory(item, cat)
+    cat = cat or S.itemCategoryKey(item)
+    if cat:find("pickaxe", 1, true) or cat:find("consum", 1, true) or cat:find("medkit", 1, true)
+        or cat == "ore" or cat == "bar" or cat == "tool" or cat == "scrap" or cat == "fuel" or cat == "corpse"
+    then
+        return nil
+    end
+    if cat:find("sword", 1, true) then
+        return "Sword"
+    end
+    if cat:find("armor", 1, true) or cat:find("armour", 1, true) then
+        return "Armor"
+    end
+    if cat:find("weapon", 1, true) or cat:find("gun", 1, true) then
+        return "Gun"
+    end
+    if cat == "" then
+        local name = string.lower(tostring(item.Name or "")):gsub("[^%a]", "")
+        if name:find("pickaxe", 1, true) then
+            return nil
+        end
+        if name:find("sword", 1, true) or name:find("excalibur", 1, true) then
+            return "Sword"
+        end
+        if name:find("helmet", 1, true) or name:find("legs", 1, true) or name:find("armor", 1, true) then
+            return "Armor"
+        end
+        if name:find("revolver", 1, true) or name:find("rifle", 1, true) or name:find("shotgun", 1, true)
+            or name:find("pistol", 1, true) or name:find("gun", 1, true)
+        then
+            return "Gun"
+        end
+    end
+    return nil
+end
+
 function S.corePickMatch(item)
     if not item or not item.Parent then
         return nil
@@ -23264,6 +23330,16 @@ function S.corePickMatch(item)
     end
     local cat = S.itemCategoryKey(item)
     if cat == "ore" or cat == "bar" then
+        return nil
+    end
+    -- Gear worth more than the minimum coins (Sword / Armor / Gun only).
+    if CoreFarm.pickGear == true and S.coreGearCategory(item, cat) then
+        local value = item:GetAttribute("Value")
+        if typeof(value) == "number" and value > (tonumber(CoreFarm.pickGearMin) or 2000) then
+            return "Gear"
+        end
+    end
+    if CoreFarm.pickUp ~= true then
         return nil
     end
     local bits = { tostring(item.Name or "") }
@@ -23314,7 +23390,7 @@ function S.corePickupPass()
         end
     end)
     for _, item in ipairs(list) do
-        if S.isBagFull() or not CoreFarm.pickUp then
+        if S.isBagFull() or not (CoreFarm.pickUp or CoreFarm.pickGear) then
             break
         end
         CoreFarm._pickTried[item] = os.clock()
@@ -23334,7 +23410,7 @@ function S.coreStartPickupLoop()
     task.spawn(function()
         while true do
             task.wait(0.6)
-            if CoreFarm.pickUp == true then
+            if CoreFarm.pickUp == true or CoreFarm.pickGear == true then
                 -- Do not fight the chest hold (it unequips tools / pins the player).
                 local chestBusy = Autofarm.busy == true and Autofarm._holdReason == "chest"
                 if not chestBusy then
@@ -23826,6 +23902,8 @@ function S.coreSyncFlags()
     setFlag("dtec_core_instant_open", CoreFarm.instantOpen == true)
     setFlag("dtec_core_pick_up", CoreFarm.pickUp == true)
     setFlag("dtec_core_pick_types", CoreFarm.pickTypes)
+    setFlag("dtec_core_pick_gear", CoreFarm.pickGear == true)
+    setFlag("dtec_core_church", CoreFarm.church == true)
 end
 
 function S.coreNoteLap()
@@ -23848,6 +23926,9 @@ function S.coreNoteLap()
     local before = CoreFarm._coresBefore
     task.spawn(function()
         S.setAutofarm(false, { skipReturn = true })
+        if CoreFarm.church == true then
+            pcall(S.dmGoToChurch, S.DrillMain.gen)
+        end
         S.coreReturnLobby(before)
     end)
 end
@@ -24034,6 +24115,16 @@ function S.buildCoreTab(Window)
         end,
     })
 
+    tab:CreateToggle({
+        Name = "Go to Church before leaving (save gears)",
+        CurrentValue = CoreFarm.church == true,
+        Flag = "dtec_core_church",
+        Callback = function(value)
+            CoreFarm.church = value == true
+            S.coreSaveQueue()
+        end,
+    })
+
     tab:CreateSection("Pick Up")
     tab:CreateToggle({
         Name = "Pick Up",
@@ -24058,7 +24149,29 @@ function S.buildCoreTab(Window)
             S.coreSaveQueue()
         end,
     })
+    tab:CreateToggle({
+        Name = "Pick Up Gear (Sword / Armor / Gun)",
+        CurrentValue = CoreFarm.pickGear == true,
+        Flag = "dtec_core_pick_gear",
+        Callback = function(value)
+            S.setPickGear(value == true, "dtec_core_pick_gear")
+        end,
+    })
+    tab:CreateInput({
+        Name = "Gear min value (coins)",
+        PlaceholderText = tostring(CoreFarm.pickGearMin or 2000),
+        RemoveTextAfterFocusLost = false,
+        Flag = "dtec_core_pick_gear_min",
+        Callback = function(text)
+            CoreFarm.pickGearMin = tonumber(text) or 2000
+            S.coreSaveQueue()
+        end,
+    })
     S.coreStartPickupLoop()
+    tab:CreateParagraph({
+        Title = "Gear",
+        Content = "Pick Up Gear grabs only swords, armor and guns worth MORE than the min value (default 2000 coins). Ores, bars, consumables, pickaxes and tools are ignored. Church: before leaving the run it goes to the church and saves your gears.",
+    })
     tab:CreateParagraph({
         Title = "Pick Up",
         Content = "Picks up every Void, King, Phoenix item (helmet, legs, chest, pickaxe, sword, gun, Excalibur...) and Revive Kit lying on the map.",
@@ -24608,6 +24721,15 @@ function S.buildTeleportTab(Window)
         Name = "Mine",
         Callback = function()
             S.teleportHubToNearest("mine")
+        end,
+    })
+
+    TeleportTab:CreateButton({
+        Name = "Church",
+        Callback = function()
+            task.spawn(function()
+                pcall(S.teleportToChurch)
+            end)
         end,
     })
 
@@ -26122,6 +26244,93 @@ function S.dmFindChurch(origin, dir)
     return best
 end
 
+-- Teleports straight to the church (loads the area first). Used by the Teleport
+-- tab button and by Go to Church. opts.setHold(cf): caller already pins the root
+-- every frame, so only update its target. Returns ok, church, centerPos.
+function S.teleportToChurch(opts)
+    opts = opts or {}
+    local DM = S.DrillMain
+    local root = S.getRoot()
+    if not root or S.isPlayerDead() then
+        S.notify("Teleport", "Character not found", 3)
+        return false
+    end
+    local origin = opts.origin or S.getDrillLineOrigin()
+    local dir = opts.dir or S.getDrillRouteAxis()
+    if not dir then
+        local okLook, look = pcall(S.getDrillFlatLook)
+        if okLook and typeof(look) == "Vector3" and look.Magnitude > 0.05 then
+            dir = look.Unit
+        else
+            dir = Vector3.new(0, 0, 1)
+        end
+    end
+    local flyY = tonumber(S.getAutofarmFlyY()) or root.Position.Y
+    local guess = origin + dir * (tonumber(DM.churchStuds) or 50000)
+    local guessPos = Vector3.new(guess.X, flyY, guess.Z)
+    local function alive()
+        return not opts.alive or opts.alive()
+    end
+
+    local holdCf = CFrame.new(guessPos)
+    local conn
+    local function hold(cf)
+        holdCf = cf
+        if opts.setHold then
+            opts.setHold(cf)
+        end
+        local r = S.getRoot()
+        if r then
+            r.CFrame = cf
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+    if not opts.setHold then
+        conn = RunService.Heartbeat:Connect(function()
+            local r = S.getRoot()
+            if r then
+                r.CFrame = holdCf
+                r.AssemblyLinearVelocity = Vector3.zero
+                r.AssemblyAngularVelocity = Vector3.zero
+            end
+        end)
+    end
+
+    hold(holdCf)
+    S.requestStreamAround(guessPos, 1.5)
+    local church
+    local deadline = os.clock() + 15
+    while alive() and os.clock() < deadline do
+        church = S.dmFindChurch(origin, dir)
+        if church then
+            break
+        end
+        S.requestStreamAround(guessPos, 0.6)
+        task.wait(0.5)
+    end
+    local center
+    if church and alive() then
+        center = S.getInstancePosition(church)
+        if center then
+            hold(CFrame.new(center + Vector3.new(0, 6, 0)))
+            S.requestStreamAround(center, 1.5)
+            task.wait(1)
+        end
+    end
+    if conn then
+        conn:Disconnect()
+    end
+    if not opts.silent then
+        if church and center then
+            S.notify("Teleport", "Church: " .. tostring(church.Name), 4)
+        else
+            S.notify("Teleport", "Church not found (~" .. tostring(DM.churchStuds) .. " studs)", 4)
+        end
+    end
+    return church ~= nil and center ~= nil, church, center
+end
+
 function S.dmGoToChurch(myGen)
     local DM = S.DrillMain
     local root = S.getRoot()
@@ -26160,25 +26369,21 @@ function S.dmGoToChurch(myGen)
 
     local stored = false
     local ok, err = pcall(function()
-        -- 1) Ir a la zona y esperar a que cargue el church.
-        S.requestStreamAround(guessCf.Position, 1.5)
-        local church
-        local deadline = os.clock() + 15
-        while alive() and os.clock() < deadline do
-            church = S.dmFindChurch(origin, dir)
-            if church then
-                break
-            end
-            S.requestStreamAround(guessCf.Position, 0.6)
-            task.wait(0.5)
-        end
+        -- 1) Teleport al church (misma funcion que el boton de la pestana Teleport).
+        local _, church, tpCenter = S.teleportToChurch({
+            alive = alive,
+            origin = origin,
+            dir = dir,
+            silent = true,
+            setHold = function(cf)
+                holdCf = cf
+            end,
+        })
         if not alive() then
             return
         end
-        local center = church and S.getInstancePosition(church) or guessCf.Position
+        local center = tpCenter or guessCf.Position
         holdCf = CFrame.new(center + Vector3.new(0, 6, 0))
-        S.requestStreamAround(center, 1.5)
-        task.wait(1)
 
         -- 2) Interactuar con todos los prompts del church.
         local prompts, seen = {}, {}
@@ -26519,6 +26724,15 @@ function S.buildDrillMainTab(Window)
         Flag = "terra_drillmain_church_dist",
         Callback = function(value)
             DM.churchStuds = math.clamp(math.floor(tonumber(value) or 50) * 1000, 1000, 100000)
+        end,
+    })
+
+    tab:CreateToggle({
+        Name = "Pick Up Gear (Sword / Armor / Gun)",
+        CurrentValue = CoreFarm.pickGear == true,
+        Flag = "terra_drillmain_pickgear",
+        Callback = function(value)
+            S.setPickGear(value == true, "terra_drillmain_pickgear")
         end,
     })
 
